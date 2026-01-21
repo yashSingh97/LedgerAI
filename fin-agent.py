@@ -1,14 +1,14 @@
+import streamlit as st
 import sqlite3
 from datetime import datetime, timedelta
 import json
 import pickle 
-import pandas as pd 
-
+from google import genai
 from typing import TypedDict, List, Dict, Optional, Any
-from langchain_ollama import ChatOllama
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
+import pandas as pd 
 
 from nodePrompts import INTERPRETER_NODE_PROMPT, RESPONDER_AGENT_PROMPT, RESPONDER_AGENT_CONVO_PROMPT, RESPONDER_AGENT_UNKNOWN_PROMPT, GENERATE_SQL_QUERY_TOOL_PROMPT
 
@@ -28,13 +28,14 @@ class AgentState(TypedDict, total=False):
     should_continue: bool
     
 
+client = genai.Client(api_key="AIzaSyCUZfxUadBkzkgPHZBzIk4-12EcZOTpHv0")
+
 # DATABASE INITIALIZATION
 DB_PATH = "finance.db"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,23 +46,10 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
-
     conn.commit()
     conn.close()
-
     print("Database initialized (transactions table ready).")
 
-
-# LLMs
-llm = ChatOllama(
-    model="llama3.1:8b",
-    temperature=0.0
-)
-
-responder_llm = ChatOllama(
-    model="llama3.1:8b",
-    temperature=0.2
-)
 
 # TOOLS
 @tool
@@ -211,25 +199,35 @@ def generate_sql_query_tool(query: str) -> dict:
     Generate a safe SQL query based on validated query details.
 
     Input:
-        user_query: str
-        query_details: dict of semantic information
+        query: query str
 
     Returns:
         dict: {"sql": "..."}
     """
     print(f"[Generate SQL Tool] Input details: {query}")
 
-    messages = [
-        SystemMessage(content=GENERATE_SQL_QUERY_TOOL_PROMPT),
-        HumanMessage(content=query)
-    ]
-    print(f"[Generate SQL Tool] Message Passed to Tool : {messages}")
-    result = llm.invoke(messages)
+    # messages = [
+    #     SystemMessage(content=GENERATE_SQL_QUERY_TOOL_PROMPT),
+    #     HumanMessage(content=query)
+    # ]
+    message = f"""QUERY: {query}
+    SYSTEM INSTRUCTIONS: {GENERATE_SQL_QUERY_TOOL_PROMPT}"""
 
-    print(f"\n\n[Generate SQL Tool] LLM output: {result.content}")
-
+    print(f"[Generate SQL Tool] Message Passed to Tool : {message}")
+    
     try:
-        parsed = json.loads(result.content)
+        llm_response = client.models.generate_content(model="gemini-2.5-flash", contents=message)
+        print(f"[Generate SQL Tool] Raw LLM Output: {llm_response.text}")
+    except Exception as e:
+        print(f"[Generate SQL Tool] LLM invocation failed: {e}")
+        return {"tasks": []}
+
+    print(f"\n\n[Generate SQL Tool] LLM output: {llm_response.text}")
+
+    # Parse JSON (removing code blocks)    
+    try:
+        cleaned = llm_response.text.strip().removeprefix('```json').removesuffix('```').strip()
+        parsed = json.loads(cleaned)
         sql = parsed.get("sql", "")
     except Exception as e:
         print(f"[GenerateSQLTool] JSON parsing failed: {e}")
@@ -262,15 +260,8 @@ def execute_sql_query_tool(sql: str) -> dict:
 
 
 # NODES 
-def interpreter_node(state: AgentState) -> AgentState:
-    """
-    Interpreter Agent Node:
-    - Reads latest user input
-    - Reads short-term memory
-    - Uses LLM to extract tasks list according to strict spec
-    - Returns {"tasks": [...]} into AgentState
-    """
 
+def interpreter_node(state: AgentState) -> AgentState:
     user_input = state.get("user_input", "")
     short_term_memory = state.get("short_term_memory", [])
     today_date_data = state.get("today_date_context", {})
@@ -279,30 +270,37 @@ def interpreter_node(state: AgentState) -> AgentState:
     print(f"[Interpreter] User Input: {user_input}")
     print(f"[Interpreter] State's ST-Memory: {short_term_memory}\n")
 
-    # Prepare messages for the LLM
-    messages = [
-        SystemMessage(content=INTERPRETER_NODE_PROMPT.replace("__TODAY_DATE_DATA__", json.dumps(today_date_data))),
-        f"MEMORY CONTEXT: {json.dumps(short_term_memory)}",
-        HumanMessage(content="USER_INPUT: " + user_input),
-    ]
+    # messages = [
+    #     SystemMessage(content=INTERPRETER_NODE_PROMPT.replace("__TODAY_DATE_DATA__", json.dumps(today_date_data))),
+    #     f"MEMORY CONTEXT: {json.dumps(short_term_memory)}",
+    #     HumanMessage(content="USER_INPUT: " + user_input),
+    # ]
     
-    print(f"[Interpreter] Message passed to LLM: {messages}\n")
+    message = f"""USER_INPUT: {user_input}
+
+MEMORY CONTEXT: {json.dumps(short_term_memory)}
+
+SYSTEM INSTRUCTIONS: {INTERPRETER_NODE_PROMPT.replace("__TODAY_DATE_DATA__", json.dumps(today_date_data))}"""
+    
+    print(f"[Interpreter] Message passed to LLM: {message}\n")
     
     # Call LLM
     try:
-        llm_response = llm.invoke(messages)
-        print(f"[Interpreter] Raw LLM Output: {llm_response.content}")
+        llm_response = client.models.generate_content(model="gemini-2.5-flash", contents=message)
+        # llm_response = llm.invoke(messages)
+        print(f"[Interpreter] Raw LLM Output: {llm_response.text}")
     except Exception as e:
         print(f"[Interpreter] LLM invocation failed: {e}")
         return {"tasks": []}
 
-    # Parse into JSON
+    # Parse JSON (removing code blocks)
     try:
-        parsed = json.loads(llm_response.content)
+        cleaned = llm_response.text.strip().removeprefix('```json').removesuffix('```').strip()
+        parsed = json.loads(cleaned)
         tasks = parsed.get("tasks", [])
     except Exception as e:
         print(f"[Interpreter] JSON parsing failed: {e}")
-        tasks = []
+        return {"tasks": []}
 
     
     has_question_mark = "?" in user_input.lower()
@@ -743,7 +741,7 @@ def prediction_agent_node(state: AgentState) -> AgentState:
     
     # Load the RF model
     try:
-        with open('rf.pkl', 'rb') as file:
+        with open('model.pkl', 'rb') as file:
             model_package = pickle.load(file)
             rf_model = model_package['model']
             metadata = model_package['metadata']
@@ -907,43 +905,35 @@ def responder_agent_node(state: AgentState) -> AgentState:
     task_type = state["current_task"]["type"]
     user_input = state.get('user_input', "")
     if task_type == "respond_to_user_convo":
-        # casual chat mode        
-        messages = [
-            SystemMessage(content=RESPONDER_AGENT_CONVO_PROMPT),
-            HumanMessage(content="USER INPUT: " + user_input)
-        ]
+        message = f""""USER INPUT: "{user_input}
+        SYSTEM INTRUCTIONS: {RESPONDER_AGENT_CONVO_PROMPT}"""
         
     elif task_type == "respond_to_user_unknown":
-        messages = [
-            SystemMessage(content=RESPONDER_AGENT_UNKNOWN_PROMPT),
-            HumanMessage(content="USER INPUT: " + user_input)
-        ]
+        message = f""""USER INPUT: "{user_input}
+        SYSTEM INTRUCTIONS: {RESPONDER_AGENT_UNKNOWN_PROMPT}"""
     else: 
-        
-        # default finance summarization mode
         results = state.get("results", [])
         print(f"[Responder Agent] Results to summarize: {results}")
     
-        # Summarize results for the LLM
         summary_text = json.dumps(results, indent=2)
         print(f"[Responder Agent] SUMMARY TEXT: {summary_text}")
     
-        messages = [
-            SystemMessage(content=RESPONDER_AGENT_PROMPT),
-            HumanMessage(content="USER INPUT: " + user_input),
-            HumanMessage(content="RESULTS of the OPERATIONS BY AGENTS: " + summary_text)
-        ]
+        message = f""""USER INPUT: "{user_input}
+        "RESULTS of the OPERATIONS BY AGENTS: "{summary_text}
+        SYSTEM INTRUCTIONS: {RESPONDER_AGENT_PROMPT}"""
 
-    print(f"\n[Responder Agent] Message passed to LLM: {messages}")
+    print(f"\n[Responder Agent] Message Passed to Tool : {message}")
+    
     try:
-        llm_response = responder_llm.invoke(messages)
-        final_output = llm_response.content
+        llm_response = client.models.generate_content(model="gemini-2.5-flash", contents=message)
+        final_output = llm_response.text
+        print(f"[Responder Agent] Raw LLM Output: {llm_response.text}")
     except Exception as e:
         print(f"[Responder Agent] LLM error: {e}")
         final_output = "I'm sorry, but I couldn't generate a response."
 
-    print(f"[Responder Agent] Final response: {final_output}")
-
+    print(f"\n\n[Responder Agent] Final Response: {final_output}")
+    
     
     # Return final state — end graph execution
     return {
@@ -953,9 +943,7 @@ def responder_agent_node(state: AgentState) -> AgentState:
 
 
 def build_graph():
-
     graph = StateGraph(AgentState)
-
     graph.add_node("Interpreter", interpreter_node)
     graph.add_node("Orchestrator", orchestrator_node)
     graph.add_node("Data Entry Agent", data_entry_agent_node)
@@ -968,13 +956,11 @@ def build_graph():
     graph.add_edge("Data Entry Agent", "Orchestrator")
     graph.add_edge("Data Query Agent", "Orchestrator")
     graph.add_edge("Prediction Agent", "Orchestrator")
-
     graph.add_edge("Responder Agent", END)
 
-    # CONDITIONAL routing from Orchestrator
     graph.add_conditional_edges(
         "Orchestrator",
-        lambda state: state["route_to"],   # route pointer from state
+        lambda state: state["route_to"],
         {
             "Data Entry Agent": "Data Entry Agent",
             "Data Query Agent": "Data Query Agent",
@@ -987,26 +973,24 @@ def build_graph():
     return app
 
 
-if __name__ == "__main__":
+# ==== STREAMLIT UI INTEGRATION (SIMPLE) ====
+
+# Initialize only once
+if 'app' not in st.session_state:
     init_db()
-    print("[main] Database initialized.")
+    st.session_state.app = build_graph()
+    print("[Streamlit] Agent initialized.")
 
-    app = build_graph()
-    print("[main] LangGraph application compiled.")
-
-    # Initial AgentState
+# Set up session state for chat
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'agent_state' not in st.session_state:
     toT = datetime.now().strftime("%Y-%m-%d")
-    state: AgentState = {
-        "user_name": "Yash",
+    st.session_state.agent_state = {
+        "user_name": "User",
         "user_input": "",
-
-        # Full long-term log
         "long_term_memory": [],
-
-        # Last 10 messages (mixed roles)
         "short_term_memory": [],
-
-        # Date context
         "today_date_context": toT,
         "tasks": [],
         "tasks_count": 0,
@@ -1017,64 +1001,74 @@ if __name__ == "__main__":
         "should_continue": True
     }
 
+# Simple Streamlit UI
+st.title("🤖 Finance AI Assistant")
+st.write("Ask about expenses, add transactions, or get predictions")
 
-    print("[main] Finance AI ready. Type 'exit' to quit.\n")
+# Display chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-    while True:
-        user_input = input("👤⬜ You: ").strip()
-        if user_input.lower() in ["exit", "quit", "bye"]:
-            print("Exiting...")
-            break
-        
-        # Update human message
-        state["long_term_memory"].append({
-            "role": "human", 
-            "content": user_input
-        })
-        
-        stm = state["short_term_memory"]
-        stm.append({
-            "role": "human",
-            "content": user_input
-        })
-        
-        state["short_term_memory"] = stm[-10:]
-        
-        # Set new input
-        state["user_input"] = user_input
+# Chat input
+if prompt := st.chat_input("Type your message..."):
+    # Display user message
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    # Prepare agent state
+    state = st.session_state.agent_state
+    state["user_input"] = prompt
+    
+    # Update memory
+    state["long_term_memory"].append({"role": "human", "content": prompt})
+    stm = state["short_term_memory"]
+    stm.append({"role": "human", "content": prompt})
+    state["short_term_memory"] = stm[-10:]
+    
+    # Run agent with spinner
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            final_state = st.session_state.app.invoke(state)
+            response = final_state.get("final_output", "No response generated.")
+            st.markdown(response)
+    
+    # Update chat history
+    st.session_state.messages.append({"role": "assistant", "content": response})
+    
+    # Update memory for next turn
+    state["long_term_memory"].append({"role": "ai", "content": response})
+    stm = state["short_term_memory"]
+    stm.append({"role": "ai", "content": response})
+    
+    # Reset state for next interaction
+    st.session_state.agent_state = {
+        "user_name": state["user_name"],
+        "user_input": "",
+        "long_term_memory": state["long_term_memory"],
+        "short_term_memory": state["short_term_memory"],
+        "today_date_context": state["today_date_context"],
+        "tasks": [],
+        "tasks_count": 0,
+        "current_task": None,
+        "results": [],
+        "route_to": None,
+        "final_output": "",
+        "should_continue": True
+    }
 
-        final_state = app.invoke(state)
-
-        final_output = final_state.get("final_output", "")
-        print(f"\n\n🤖💬 AI: {final_output}\n\n")
-
-        # Update AI Message
-        # -------------------------------------
-        state["long_term_memory"].append({
-            "role": "ai", 
-            "content": final_output
-        })
-        stm = state["short_term_memory"]
-        stm.append({
-            "role": "ai",
-            "content": final_output
-        })
-
-        
-        # Reset per-turn state
-        state = {
-            "user_name": final_state["user_name"],
-            "user_input": "",
-
-            "long_term_memory": final_state["long_term_memory"],
-            "short_term_memory": final_state["short_term_memory"],
-
-            "today_date_context": final_state["today_date_context"],
-            "tasks": [],
-            "tasks_count": 0,
-            "current_task": None,
-            "results": [],
-            "route_to": None,
-            "final_output": "",
-            "should_continue": True
-        }
+# Optional: Add a sidebar for quick actions
+with st.sidebar:
+    st.header("Quick Actions")
+    if st.button("Clear Chat"):
+        st.session_state.messages = []
+        st.rerun()
+    
+    # Show some stats
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM transactions")
+    count = cursor.fetchone()[0]
+    st.metric("Total Transactions", count)
+    conn.close()
